@@ -55,6 +55,14 @@ import os from "os";
 import path from "path";
 import React from "react";
 
+
+// If the user passed the incredibly unsafe `--dangerously-auto-approve-everything` flag we
+// mark the process via an env-var so that other parts of the code-base can pick up on the
+// instruction and skip sandboxing entirely.
+if (process.argv.includes("--dangerously-auto-approve-everything")) {
+  process.env["CODEX_DANGEROUSLY_AUTO_APPROVE_EVERYTHING"] = "1";
+}
+
 // Call this early so `tail -F "$TMPDIR/oai-codex/codex-cli-latest.log"` works
 // immediately. This must be run with DEBUG=1 for logging to work.
 initLogger();
@@ -537,9 +545,11 @@ if (cli.flags.quiet) {
   const quietApprovalPolicy: ApprovalPolicy =
     cli.flags.fullAuto || cli.flags.approvalMode === "full-auto"
       ? AutoApprovalMode.FULL_AUTO
-      : cli.flags.autoEdit || cli.flags.approvalMode === "auto-edit"
-        ? AutoApprovalMode.AUTO_EDIT
-        : config.approvalMode || AutoApprovalMode.SUGGEST;
+      : cli.flags.dangerouslyAutoApproveEverything
+        ? AutoApprovalMode.FULL_AUTO
+        : cli.flags.autoEdit || cli.flags.approvalMode === "auto-edit"
+          ? AutoApprovalMode.AUTO_EDIT
+          : config.approvalMode || AutoApprovalMode.SUGGEST;
 
   await runQuietMode({
     prompt,
@@ -568,9 +578,11 @@ if (cli.flags.quiet) {
 const approvalPolicy: ApprovalPolicy =
   cli.flags.fullAuto || cli.flags.approvalMode === "full-auto"
     ? AutoApprovalMode.FULL_AUTO
-    : cli.flags.autoEdit || cli.flags.approvalMode === "auto-edit"
-      ? AutoApprovalMode.AUTO_EDIT
-      : config.approvalMode || AutoApprovalMode.SUGGEST;
+    : cli.flags.dangerouslyAutoApproveEverything
+      ? AutoApprovalMode.FULL_AUTO
+      : cli.flags.autoEdit || cli.flags.approvalMode === "auto-edit"
+        ? AutoApprovalMode.AUTO_EDIT
+        : config.approvalMode || AutoApprovalMode.SUGGEST;
 
 const instance = render(
   <App

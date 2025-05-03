@@ -137,6 +137,17 @@ export async function handleExecCommand(
     }
   }
 
+  const dangerouslyAutoApproveEverything = Boolean(
+    process.env["CODEX_DANGEROUSLY_AUTO_APPROVE_EVERYTHING"] || "",
+  );
+
+  // If the user explicitly opted into the extremely unsafe mode then we must
+  // execute the command directly on the host, regardless of what the
+  // auto-approval logic would normally request.
+  if (dangerouslyAutoApproveEverything) {
+    runInSandbox = false;
+  }
+
   const { applyPatch } = safety;
   const summary = await execCommand(
     args,
