@@ -17,6 +17,60 @@ import chalk, { type ForegroundColorName } from "chalk";
 import { Box, Text } from "ink";
 import { parse, setOptions } from "marked";
 import TerminalRenderer from "marked-terminal";
+
+const termRendererProto: any = (TerminalRenderer as unknown as { prototype: any }).prototype;
+if (!termRendererProto.__codexPatched) {
+  const bulletPoint = "* ";
+
+  termRendererProto.text = function (text: any) {
+    if (typeof text === "object") {
+      text = text.tokens ? this.parser.parseInline(text.tokens) : text.text;
+    }
+    return this.o.text(text);
+  };
+
+  termRendererProto.listitem = function (text: any) {
+    if (typeof text === "object") {
+      const item = text;
+      text = "";
+      if (item.task) {
+        const checkbox = this.checkbox({ checked: !!item.checked });
+        if (item.loose) {
+          if (item.tokens.length > 0 && item.tokens[0].type === "paragraph") {
+            item.tokens[0].text = checkbox + " " + item.tokens[0].text;
+            if (
+              item.tokens[0].tokens &&
+              item.tokens[0].tokens.length > 0 &&
+              item.tokens[0].tokens[0].type === "text"
+            ) {
+              item.tokens[0].tokens[0].text =
+                checkbox + " " + item.tokens[0].tokens[0].text;
+            }
+          } else {
+            item.tokens.unshift({
+              type: "text",
+              raw: checkbox + " ",
+              text: checkbox + " ",
+            });
+          }
+        } else {
+          text += checkbox + " ";
+        }
+      }
+
+      text += this.parser.parse(item.tokens, !!item.loose);
+    }
+
+    const isNested = text.indexOf("\n") !== -1;
+    if (!isNested) {
+      text = this.o.listitem(this.transform(text));
+    }
+
+    return "\n" + bulletPoint + text;
+  };
+
+  termRendererProto.__codexPatched = true;
+}
 import path from "path";
 import React, { useEffect, useMemo } from "react";
 import { formatCommandForDisplay } from "src/format-command.js";
