@@ -302,7 +302,7 @@ fn history_log_id(metadata: &std::fs::Metadata) -> Option<u64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
@@ -310,9 +310,8 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
-    #[cfg(windows)]
     #[tokio::test]
-    async fn lookup_reads_windows_history_entries() {
+    async fn lookup_reads_history_entries() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let history_path = temp_dir.path().join(HISTORY_FILENAME);
 
@@ -347,7 +346,6 @@ mod tests {
         assert_eq!(second_entry, entries[1]);
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn lookup_uses_stable_log_id_after_appends() {
         let temp_dir = TempDir::new().expect("create temp dir");
