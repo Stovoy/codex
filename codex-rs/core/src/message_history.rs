@@ -18,6 +18,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Result;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -42,7 +43,7 @@ const HISTORY_FILENAME: &str = "history.jsonl";
 const MAX_RETRIES: usize = 10;
 const RETRY_SLEEP: Duration = Duration::from_millis(100);
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
     pub session_id: String,
     pub ts: u64,
@@ -142,41 +143,7 @@ pub(crate) async fn append_entry(
 /// the current number of entries by counting newline characters.
 pub(crate) async fn history_metadata(config: &Config) -> (u64, usize) {
     let path = history_filepath(config);
-
-    #[cfg(unix)]
-    let log_id = {
-        use std::os::unix::fs::MetadataExt;
-        // Obtain metadata (async) to get the identifier.
-        let meta = match fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
-            Err(_) => return (0, 0),
-        };
-        meta.ino()
-    };
-    #[cfg(not(unix))]
-    let log_id = 0u64;
-
-    // Open the file.
-    let mut file = match fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(_) => return (log_id, 0),
-    };
-
-    // Count newline bytes.
-    let mut buf = [0u8; 8192];
-    let mut count = 0usize;
-    loop {
-        match file.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
-            }
-            Err(_) => return (log_id, 0),
-        }
-    }
-
-    (log_id, count)
+    history_metadata_for_file(&path).await
 }
 
 /// Given a `log_id` (on Unix this is the file's inode number) and a zero-based
@@ -186,78 +153,14 @@ pub(crate) async fn history_metadata(config: &Config) -> (u64, usize) {
 ///
 /// Note this function is not async because it uses a sync advisory file
 /// locking API.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<HistoryEntry> {
-    use std::io::BufRead;
-    use std::io::BufReader;
-    use std::os::unix::fs::MetadataExt;
-
     let path = history_filepath(config);
-    let file: File = match OpenOptions::new().read(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to open history file");
-            return None;
-        }
-    };
-
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to stat history file");
-            return None;
-        }
-    };
-
-    if metadata.ino() != log_id {
-        return None;
-    }
-
-    // Open & lock file for reading using a shared lock.
-    // Retry a few times to avoid indefinite blocking.
-    for _ in 0..MAX_RETRIES {
-        let lock_result = file.try_lock_shared();
-
-        match lock_result {
-            Ok(()) => {
-                let reader = BufReader::new(&file);
-                for (idx, line_res) in reader.lines().enumerate() {
-                    let line = match line_res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to read line from history file");
-                            return None;
-                        }
-                    };
-
-                    if idx == offset {
-                        match serde_json::from_str::<HistoryEntry>(&line) {
-                            Ok(entry) => return Some(entry),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to parse history entry");
-                                return None;
-                            }
-                        }
-                    }
-                }
-                // Not found at requested offset.
-                return None;
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                std::thread::sleep(RETRY_SLEEP);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to acquire shared lock on history file");
-                return None;
-            }
-        }
-    }
-
-    None
+    lookup_history_entry(&path, log_id, offset)
 }
 
-/// Fallback stub for non-Unix systems: currently always returns `None`.
-#[cfg(not(unix))]
+/// Fallback stub for unsupported platforms: currently always returns `None`.
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn lookup(log_id: u64, offset: usize, config: &Config) -> Option<HistoryEntry> {
     let _ = (log_id, offset, config);
     None
@@ -283,4 +186,208 @@ async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
     // For now, on non-Unix, simply succeed.
     Ok(())
+}
+
+async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
+    let log_id = match fs::metadata(path).await {
+        Ok(metadata) => history_log_id(&metadata).unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+        Err(_) => return (0, 0),
+    };
+
+    let mut file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return (log_id, 0),
+    };
+
+    let mut buf = [0u8; 8192];
+    let mut count = 0usize;
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+            }
+            Err(_) => return (log_id, 0),
+        }
+    }
+
+    (log_id, count)
+}
+
+#[cfg(any(unix, windows))]
+fn lookup_history_entry(path: &Path, log_id: u64, offset: usize) -> Option<HistoryEntry> {
+    use std::io::BufRead;
+    use std::io::BufReader;
+
+    let file: File = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open history file");
+            return None;
+        }
+    };
+
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to stat history file");
+            return None;
+        }
+    };
+
+    let current_log_id = history_log_id(&metadata)?;
+
+    if log_id != 0 && current_log_id != log_id {
+        return None;
+    }
+
+    for _ in 0..MAX_RETRIES {
+        let lock_result = file.try_lock_shared();
+
+        match lock_result {
+            Ok(()) => {
+                let reader = BufReader::new(&file);
+                for (idx, line_res) in reader.lines().enumerate() {
+                    let line = match line_res {
+                        Ok(line) => line,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to read line from history file");
+                            return None;
+                        }
+                    };
+
+                    if idx == offset {
+                        match serde_json::from_str::<HistoryEntry>(&line) {
+                            Ok(entry) => return Some(entry),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to parse history entry");
+                                return None;
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(RETRY_SLEEP);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to acquire shared lock on history file");
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+fn history_log_id(metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Some(metadata.ino());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(metadata.creation_time())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn lookup_reads_windows_history_entries() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let history_path = temp_dir.path().join(HISTORY_FILENAME);
+
+        let entries = vec![
+            HistoryEntry {
+                session_id: "first-session".to_string(),
+                ts: 1,
+                text: "first".to_string(),
+            },
+            HistoryEntry {
+                session_id: "second-session".to_string(),
+                ts: 2,
+                text: "second".to_string(),
+            },
+        ];
+
+        let mut file = File::create(&history_path).expect("create history file");
+        for entry in &entries {
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(entry).expect("serialize history entry")
+            )
+            .expect("write history entry");
+        }
+
+        let (log_id, count) = history_metadata_for_file(&history_path).await;
+        assert_eq!(count, entries.len());
+
+        let second_entry =
+            lookup_history_entry(&history_path, log_id, 1).expect("fetch second history entry");
+        assert_eq!(second_entry, entries[1]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn lookup_uses_stable_log_id_after_appends() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let history_path = temp_dir.path().join(HISTORY_FILENAME);
+
+        let initial = HistoryEntry {
+            session_id: "first-session".to_string(),
+            ts: 1,
+            text: "first".to_string(),
+        };
+        let appended = HistoryEntry {
+            session_id: "second-session".to_string(),
+            ts: 2,
+            text: "second".to_string(),
+        };
+
+        let mut file = File::create(&history_path).expect("create history file");
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&initial).expect("serialize initial entry")
+        )
+        .expect("write initial entry");
+
+        let (log_id, count) = history_metadata_for_file(&history_path).await;
+        assert_eq!(count, 1);
+
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&history_path)
+            .expect("open history file for append");
+        writeln!(
+            append,
+            "{}",
+            serde_json::to_string(&appended).expect("serialize appended entry")
+        )
+        .expect("append history entry");
+
+        let fetched =
+            lookup_history_entry(&history_path, log_id, 1).expect("lookup appended history entry");
+        assert_eq!(fetched, appended);
+    }
 }
